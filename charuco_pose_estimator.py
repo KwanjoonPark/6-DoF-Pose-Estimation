@@ -19,7 +19,18 @@ class CharucoPoseEstimator:
         self.SQUARE_LENGTH = 0.02  # 2.0 cm -> 0.02 m (OpenCV uses meters internally)
         self.MARKER_LENGTH = 0.015  # 1.5 cm -> 0.015 m
         self.ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_250)
-        self.parameters = aruco.DetectorParameters_create()
+
+        # ArUco Detector and Parameters (OpenCV version compatibility)
+        self.use_new_aruco_api = False
+        try:
+            self.parameters = cv2.aruco.DetectorParameters()
+            self.detector = cv2.aruco.ArucoDetector(self.ARUCO_DICT, self.parameters)
+            self.use_new_aruco_api = True
+            print("✅ New Aruco API (Detector object) 사용 가능")
+        except AttributeError:
+            self.parameters = cv2.aruco.DetectorParameters_create()
+            print("⚠️ Old Aruco API (standalone functions) 사용")
+
         self.parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
         self.parameters.minMarkerPerimeterRate = 0.01
 
@@ -32,12 +43,30 @@ class CharucoPoseEstimator:
         self.parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
         self.parameters.cornerRefinementWinSize = 5
 
-        # ChArUco Marker Generation
-        self.board = aruco.CharucoBoard_create(
-            self.SQUARES_X, self.SQUARES_Y, 
-            self.SQUARE_LENGTH, self.MARKER_LENGTH, 
-            self.ARUCO_DICT
-        )
+        # ChArUco Marker Generation (OpenCV version compatibility)
+        self.use_charuco_detector = False
+        try:
+            # For OpenCV 4.7.0 and later
+            self.board = cv2.aruco.CharucoBoard(
+                (self.SQUARES_X, self.SQUARES_Y),
+                self.SQUARE_LENGTH,
+                self.MARKER_LENGTH,
+                self.ARUCO_DICT
+            )
+            # 기준점을 좌측 하단으로 설정 (구버전과 동일하게)
+            self.board.setLegacyPattern(True)
+            self.charuco_detector = cv2.aruco.CharucoDetector(self.board)
+            self.use_charuco_detector = True
+            print("✅ CharucoBoard() + CharucoDetector() 사용 가능 (OpenCV 4.7+, LegacyPattern=True)")
+        except AttributeError:
+            # For older OpenCV versions
+            self.board = cv2.aruco.CharucoBoard_create(
+                self.SQUARES_X, self.SQUARES_Y,
+                self.SQUARE_LENGTH, self.MARKER_LENGTH,
+                self.ARUCO_DICT
+            )
+            self.charuco_detector = None
+            print("⚠️ CharucoBoard_create() 사용 (구버전 OpenCV)")
 
         # ROS Settings
         self.bridge = CvBridge()
@@ -108,114 +137,157 @@ class CharucoPoseEstimator:
 
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # 1. Detect Marker
-        corners, ids, rejected = aruco.detectMarkers(gray, self.ARUCO_DICT, parameters=self.parameters)
+        # 1. Detect Marker and Charuco corners (handle OpenCV version)
+        if self.use_charuco_detector:
+            # OpenCV 4.7+ : CharucoDetector로 한 번에 검출
+            charuco_corners, charuco_ids, corners, ids = self.charuco_detector.detectBoard(gray)
+        else:
+            # 구버전: 2단계로 검출
+            if self.use_new_aruco_api:
+                corners, ids, rejected = self.detector.detectMarkers(gray)
+            else:
+                corners, ids, rejected = aruco.detectMarkers(gray, self.ARUCO_DICT, parameters=self.parameters)
+
+            if ids is not None and len(corners) > 0:
+                retval, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+                    corners, ids, gray, self.board
+                )
+            else:
+                charuco_corners, charuco_ids = None, None
 
         # Debugging with Marker Image on Screen
         if ids is not None:
             aruco.drawDetectedMarkers(cv_image, corners, ids)
 
-        if len(corners) > 0:
-            # 2. 보간
-            retval, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
-                corners, ids, gray, self.board
-            )
-
-            if charuco_corners is not None and len(charuco_corners) > 0:
-                # 3. Pose Estimation
+        if charuco_corners is not None and len(charuco_corners) > 0:
+            # 2. Pose Estimation (handle OpenCV version)
+            if self.use_charuco_detector:
+                # OpenCV 4.7+
+                obj_points, img_points = self.board.matchImagePoints(charuco_corners, charuco_ids)
+                if obj_points is not None and len(obj_points) >= 6:
+                    valid, rvec, tvec = cv2.solvePnP(
+                        obj_points, img_points, self.camera_matrix, self.dist_coeffs
+                    )
+                else:
+                    valid = False
+            else:
+                # 구버전
                 valid, rvec, tvec = aruco.estimatePoseCharucoBoard(
-                    charuco_corners, charuco_ids, self.board, 
+                    charuco_corners, charuco_ids, self.board,
                     self.camera_matrix, self.dist_coeffs, None, None
                 )
 
-                if valid:
-                    # Draw Axis
-                    cv2.drawFrameAxes(cv_image, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
+            if valid:
+                # 원점을 우측 상단으로 이동
+                # 보드 크기: SQUARES_X * SQUARE_LENGTH (가로), SQUARES_Y * SQUARE_LENGTH (세로)
+                board_width = self.SQUARES_X * self.SQUARE_LENGTH  # 0.10m
 
-                    # coordinates (tvec is in meters, convert to cm)
-                    pos_cm = tvec.T[0] * 100  # m -> cm
-                    pos_text = f"Pos(cm): X={pos_cm[0]:.2f}, Y={pos_cm[1]:.2f}, Z={pos_cm[2]:.2f}"
-                    cv2.putText(cv_image, pos_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # 보드 좌표계에서 우측 상단으로 이동하는 오프셋 (X축으로 보드 폭만큼)
+                R_board, _ = cv2.Rodrigues(rvec)
+                offset_in_board = np.array([board_width, 0, 0])  # 보드 좌표계에서 X+방향으로 이동
+                offset_in_camera = R_board @ offset_in_board  # 카메라 좌표계로 변환
 
-                    # Euclidean distance from camera
-                    distance_cm = np.linalg.norm(tvec) * 100  # m -> cm
-                    dist_text = f"Distance(cm): {distance_cm:.2f}"
-                    cv2.putText(cv_image, dist_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                tvec_top_right = tvec.flatten() + offset_in_camera
 
-                    # Convert rotation vector to rotation matrix
-                    R, _ = cv2.Rodrigues(rvec)
+                # Draw Axis (우측 상단 기준)
+                cv2.drawFrameAxes(cv_image, self.camera_matrix, self.dist_coeffs, rvec, tvec_top_right.reshape(3,1), 0.05)
 
-                    # Calculate Euler angles using scipy convention (intrinsic XYZ)
-                    # This method is more reliable for OpenCV coordinate system
+                # X축, Z축 방향 반전
+                tvec_adjusted = np.array([
+                    -tvec_top_right[0],  # X축 반전
+                    tvec_top_right[1],   # Y축 유지
+                    -tvec_top_right[2]   # Z축 반전
+                ])
 
-                    # Extract angles from rotation matrix
-                    # Using ZYX Euler angles (more common in robotics)
-                    sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+                # coordinates (tvec is in meters, convert to cm)
+                pos_cm = tvec_adjusted * 100  # m -> cm
+                pos_text = f"Pos(cm): X={pos_cm[0]:.2f}, Y={pos_cm[1]:.2f}, Z={pos_cm[2]:.2f}"
+                cv2.putText(cv_image, pos_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    singular = sy < 1e-6
+                # Euclidean distance from camera (좌측 하단 기준)
+                distance_cm = np.linalg.norm(tvec_top_right) * 100  # m -> cm
+                dist_text = f"Distance(cm): {distance_cm:.2f}"
+                cv2.putText(cv_image, dist_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    if not singular:
-                        # Non-singular case
-                        rx = np.degrees(np.arctan2(R[2, 1], R[2, 2]))   # RX corresponds to Pitch
-                        ry = np.degrees(np.arctan2(-R[2, 0], sy))      # RY corresponds to Yaw
-                        rz = np.degrees(np.arctan2(R[1, 0], R[0, 0]))    # RZ corresponds to Roll
-                    else:
-                        # Gimbal lock case
-                        rx = np.degrees(np.arctan2(-R[1, 2], R[1, 1]))
-                        ry = np.degrees(np.arctan2(-R[2, 0], sy))
-                        rz = 0
+                # R_board는 위에서 이미 계산됨
+                R = R_board
 
-                    # Normalize RX (Pitch) to be 0 when board faces camera
-                    # RX is around ±180 when facing camera, so we normalize it
-                    # Forward tilt → negative, Backward tilt → positive
-                    if rx > 90:
-                        pitch = rx - 180  # Convert 180 to 0, 90 to -90
-                    elif rx < -90:
-                        pitch = rx + 180  # Convert -180 to 0, -90 to 90
-                    else:
-                        pitch = rx
+                # Calculate Euler angles using scipy convention (intrinsic XYZ)
+                # This method is more reliable for OpenCV coordinate system
 
-                    yaw = ry
-                    roll = rz
+                # Extract angles from rotation matrix
+                # Using ZYX Euler angles (more common in robotics)
+                sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
 
-                    angle_text = f"Angle(deg): Pitch={pitch:.1f}, Yaw={yaw:.1f}, Roll={roll:.1f}"
-                    cv2.putText(cv_image, angle_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                singular = sy < 1e-6
 
-                    # Apply 3cm downward offset (in camera coordinate: +Y is down)
-                    # Create transformation matrix for marker
-                    T_cam_marker = np.eye(4)
-                    T_cam_marker[:3, :3] = R
-                    T_cam_marker[:3, 3] = tvec.flatten()
+                if not singular:
+                    # Non-singular case
+                    rx = np.degrees(np.arctan2(R[2, 1], R[2, 2]))   # RX corresponds to Pitch
+                    ry = np.degrees(np.arctan2(-R[2, 0], sy))      # RY corresponds to Yaw
+                    rz = np.degrees(np.arctan2(R[1, 0], R[0, 0]))    # RZ corresponds to Roll
+                else:
+                    # Gimbal lock case
+                    rx = np.degrees(np.arctan2(-R[1, 2], R[1, 1]))
+                    ry = np.degrees(np.arctan2(-R[2, 0], sy))
+                    rz = 0
 
-                    # Offset matrix: 3cm down in Y direction (0.03m)
-                    T_marker_offset = np.eye(4)
-                    T_marker_offset[1, 3] = -0.06  # +Y = down in camera coordinates
+                # Normalize RX (Pitch) to be 0 when board faces camera
+                # RX is around ±180 when facing camera, so we normalize it
+                # Forward tilt → negative, Backward tilt → positive
+                if rx > 90:
+                    pitch = rx - 180  # Convert 180 to 0, 90 to -90
+                elif rx < -90:
+                    pitch = rx + 180  # Convert -180 to 0, -90 to 90
+                else:
+                    pitch = rx
 
-                    # Apply offset
-                    T_cam_offset = np.dot(T_cam_marker, T_marker_offset)
-                    offset_position = T_cam_offset[:3, 3]
+                yaw = ry
+                roll = rz
 
-                    # Project offset position to image plane and draw blue dot
-                    offset_point_3d = np.array([offset_position], dtype=np.float32)
-                    offset_pixel_2d, _ = cv2.projectPoints(offset_point_3d, np.zeros(3), np.zeros(3),
-                                                           self.camera_matrix, self.dist_coeffs)
-                    offset_pixel = (int(offset_pixel_2d[0][0][0]), int(offset_pixel_2d[0][0][1]))
-                    cv2.circle(cv_image, offset_pixel, 5, (255, 0, 0), -1)  # Blue dot
+                angle_text = f"Angle(deg): Pitch={pitch:.1f}, Yaw={yaw:.1f}, Roll={roll:.1f}"
+                cv2.putText(cv_image, angle_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    # Calculate offset position in cm and its distance
-                    offset_pos_cm = offset_position * 100  # m -> cm
-                    offset_distance_cm = np.linalg.norm(offset_position) * 100  # m -> cm
+                # Apply 3cm downward offset (in camera coordinate: +Y is down)
+                # Create transformation matrix for marker (좌측 하단 기준)
+                T_cam_marker = np.eye(4)
+                T_cam_marker[:3, :3] = R
+                T_cam_marker[:3, 3] = tvec_top_right
 
-                    # Store offset-applied pose data for potential saving
-                    self.current_pose_data = {
-                        'distance': offset_distance_cm,
-                        'pitch': pitch,
-                        'yaw': yaw,
-                        'roll': roll,
-                        'x': offset_pos_cm[0],
-                        'y': offset_pos_cm[1],
-                        'z': offset_pos_cm[2]
-                    }
+                # Offset matrix: 3cm down in Y direction (0.03m)
+                T_marker_offset = np.eye(4)
+                T_marker_offset[1, 3] = -0.06  # +Y = down in camera coordinates
+
+                # Apply offset
+                T_cam_offset = np.dot(T_cam_marker, T_marker_offset)
+                offset_position = T_cam_offset[:3, 3]
+
+                # Project offset position to image plane and draw blue dot
+                offset_point_3d = np.array([offset_position], dtype=np.float32)
+                offset_pixel_2d, _ = cv2.projectPoints(offset_point_3d, np.zeros(3), np.zeros(3),
+                                                       self.camera_matrix, self.dist_coeffs)
+                px = int(float(offset_pixel_2d[0][0][0]))
+                py = int(float(offset_pixel_2d[0][0][1]))
+                cv2.circle(cv_image, (px, py), 5, (255, 0, 0), -1)  # Blue dot
+
+                # Calculate offset position in cm and its distance (X축, Z축 반전)
+                offset_pos_cm = np.array([
+                    -offset_position[0],  # X축 반전
+                    offset_position[1],   # Y축 유지
+                    -offset_position[2]   # Z축 반전
+                ]) * 100  # m -> cm
+                offset_distance_cm = np.linalg.norm(offset_position) * 100  # m -> cm
+
+                # Store offset-applied pose data for potential saving
+                self.current_pose_data = {
+                    'distance': offset_distance_cm,
+                    'pitch': pitch,
+                    'yaw': yaw,
+                    'roll': roll,
+                    'x': offset_pos_cm[0],
+                    'y': offset_pos_cm[1],
+                    'z': offset_pos_cm[2]
+                }
 
         # screen output
         cv2.imshow("ROS ChArUco Pose", cv_image)
