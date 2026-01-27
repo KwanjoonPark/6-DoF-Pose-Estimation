@@ -1,26 +1,28 @@
 import cv2
 import numpy as np
 import os
+import sys
+
+# 상위 디렉토리의 charuco_config.py를 import하기 위해 경로 추가
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from charuco_config import (
+    CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y,
+    CHARUCO_SQUARE_LENGTH, CHARUCO_MARKER_LENGTH
+)
 
 # ==========================================
 # 1. 설정 (사용자 최적화 값 유지)
 # ==========================================
-IMAGES_DIR = "images"
-PROCESSED_DIR = "dataset/final_solid_color"
-DEBUG_DIR = "dataset/debug_solid_color"
+IMAGES_DIR = "test_scene/rgb"
+PROCESSED_DIR = "test_scene/rgb_solid"
+DEBUG_DIR = "test/debug_solid_color"
 
 # 마진 비율 (넓게 잡음)
-MARGIN_RATIO = 0.46
+MARGIN_RATIO = 0.6
 # 마스크 확장 (흰색 테두리 완전 제거)
-DILATION_ITERATIONS = 10
+DILATION_ITERATIONS = 20
 # 경계선 부드럽게 (홀수)
 BLUR_KERNEL_SIZE = (21, 21)
-
-# ChArUco 파라미터
-CHARUCO_SQUARES_X = 5
-CHARUCO_SQUARES_Y = 4
-CHARUCO_SQUARE_LENGTH = 0.02
-CHARUCO_MARKER_LENGTH = 0.015
 
 for d in [PROCESSED_DIR, DEBUG_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -106,24 +108,32 @@ def get_smart_grabcut_mask(image, corners):
 def fill_with_solid_color_sample(image, mask, corners):
     """
     [요청 반영] 텍스처 복사 X, 노이즈 추가 X
-    오직 '한 포인트의 색상'만 추출해서 단색으로 채우고, 경계만 부드럽게 처리.
+    마스크 바깥 영역에서 여러 포인트를 샘플링하여 중앙값 색상으로 채움.
+    Returns: (result_image, sample_point (sx, sy))
     """
-    if not np.any(mask): return image
+    if not np.any(mask): return image, None
     h, w = image.shape[:2]
-    
-    # 1. 색상 샘플링 위치 계산 (왼쪽 안전 구역)
+
+    # 1. 보드 오른쪽에서 색상 샘플링
     all_pts = np.vstack([c[0] for c in corners])
-    min_x = np.min(all_pts[:, 0])
-    mean_y = np.mean(all_pts[:, 1])
-    board_w = np.max(all_pts[:, 0]) - np.min(all_pts[:, 0])
-    
-    # 보드 크기에 비례해서 왼쪽으로 이동 (마진 안쪽 안전한 곳)
-    offset = int(board_w * 0.4)
-    sx = max(0, min(int(min_x - offset), w - 1))
-    sy = max(0, min(int(mean_y), h - 1))
-    
-    # 2. 단일 포인트 색상 추출 (스포이트)
-    sample_color = image[sy, sx].astype(np.float32)
+    max_x = int(np.max(all_pts[:, 0]))
+    min_y = int(np.min(all_pts[:, 1]))
+    max_y = int(np.max(all_pts[:, 1]))
+    board_w = max_x - int(np.min(all_pts[:, 0]))
+
+    # 오른쪽 상단 지점에서 샘플링
+    board_h = max_y - min_y
+    sample_offset = int(board_w * 0.6)
+    sx = min(w - 1, max_x + sample_offset)
+    sy = max(0, min_y - int(board_h * 0.3))  # 위로 이동
+
+    # 마스크 바깥인지 확인 후 샘플링
+    if mask[sy, sx] == 0:
+        sample_color = image[sy, sx].astype(np.float32)
+    else:
+        # 폴백: 정중앙
+        sx, sy = w // 2, h // 2
+        sample_color = image[sy, sx].astype(np.float32)
 
     # 3. 단색 레이어 생성 (전체 이미지 크기, 노이즈 없음!)
     solid_layer = np.full((h, w, 3), sample_color, dtype=np.float32)
@@ -137,10 +147,10 @@ def fill_with_solid_color_sample(image, mask, corners):
     # 마스크 영역은 단색 레이어, 나머지는 원본 이미지 사용
     foreground = solid_layer * alpha
     background = image.astype(np.float32) * (1.0 - alpha)
-    
+
     result = cv2.add(foreground, background).astype(np.uint8)
-    
-    return result
+
+    return result, (sx, sy)
 
 # ==========================================
 # 실행
@@ -168,14 +178,20 @@ for idx, img_name in enumerate(image_files):
     board_mask = get_smart_grabcut_mask(image, corners)
 
     # 2. 단색 채우기 (노이즈/텍스처 없음)
-    image_clean = fill_with_solid_color_sample(image, board_mask, corners)
+    image_clean, sample_pt = fill_with_solid_color_sample(image, board_mask, corners)
 
-    cv2.imwrite(os.path.join(PROCESSED_DIR, f"final_{img_name.split('.')[0]}.png"), image_clean)
+    cv2.imwrite(os.path.join(PROCESSED_DIR, f"{img_name.split('.')[0]}.png"), image_clean)
 
     if idx % 10 == 0:
-        debug = image_clean.copy()
+        # 원본 이미지에 샘플링 위치 표시
+        debug = image.copy()
+        if sample_pt:
+            sx, sy = sample_pt
+            cv2.circle(debug, (sx, sy), 10, (0, 0, 255), -1)  # 빨간 원
+            cv2.putText(debug, f"Sample: ({sx}, {sy})", (sx + 15, sy),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         cv2.putText(debug, "Method: Solid Color Sample", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imwrite(os.path.join(DEBUG_DIR, f"debug_solid_{img_name}"), debug)
-        print(f"✅ {img_name} Done")
+        print(f"✅ {img_name} Done (sample at {sample_pt})")
 
 print("\n🎉 완료! 요청하신 대로 '단색'으로 깔끔하게 덮었습니다.")

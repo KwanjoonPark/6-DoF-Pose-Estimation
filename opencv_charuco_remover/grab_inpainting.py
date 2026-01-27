@@ -1,26 +1,28 @@
 import cv2
 import numpy as np
 import os
+import sys
+
+# 상위 디렉토리의 charuco_config.py를 import하기 위해 경로 추가
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from charuco_config import (
+    CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y,
+    CHARUCO_SQUARE_LENGTH, CHARUCO_MARKER_LENGTH
+)
 
 # ==========================================
 # 1. 설정 (사용자 최적화 값 유지)
 # ==========================================
-IMAGES_DIR = "images"
-PROCESSED_DIR = "dataset/final_stable_inpainting"
-DEBUG_DIR = "dataset/debug_stable"
+IMAGES_DIR = "test_scene/rgb"
+PROCESSED_DIR = "test_scene/rgb_inpainting"
+DEBUG_DIR = "test/debug_solid_color"
 
 # 마진 비율 (0.45 = 45% 여유, 넓게 잡음)
-MARGIN_RATIO = 0.45
+MARGIN_RATIO = 0.6
 # 마스크 확장 (흰색 테두리 완전 제거용, 중요!)
-DILATION_ITERATIONS = 12
+DILATION_ITERATIONS = 30
 # 인페인팅 참조 반경 (주변 픽셀 탐색 범위)
-INPAINT_RADIUS = 5
-
-# ChArUco 파라미터
-CHARUCO_SQUARES_X = 5
-CHARUCO_SQUARES_Y = 4
-CHARUCO_SQUARE_LENGTH = 0.02
-CHARUCO_MARKER_LENGTH = 0.015
+INPAINT_RADIUS = 3
 
 for d in [PROCESSED_DIR, DEBUG_DIR]:
     os.makedirs(d, exist_ok=True)

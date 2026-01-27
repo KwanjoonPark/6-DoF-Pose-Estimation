@@ -40,6 +40,10 @@ import os
 import argparse
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge, CvBridgeError
+from charuco_config import (
+    CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y,
+    CHARUCO_SQUARE_LENGTH, CHARUCO_MARKER_LENGTH
+)
 
 
 class FoundationPoseCollector:
@@ -60,24 +64,24 @@ class FoundationPoseCollector:
         for d in [self.rgb_dir, self.depth_dir, self.masks_dir, self.ob_in_cam_dir, self.model_dir]:
             os.makedirs(d, exist_ok=True)
 
-        # ChArUco 보드 설정
-        self.SQUARES_X = 4
-        self.SQUARES_Y = 6
-        self.SQUARE_LENGTH = 0.025  # 2.5 cm
-        self.MARKER_LENGTH = 0.018  # 1.8 cm
+        # ChArUco 보드 설정 (charuco_config.py에서 import)
+        self.SQUARES_X = CHARUCO_SQUARES_X
+        self.SQUARES_Y = CHARUCO_SQUARES_Y
+        self.SQUARE_LENGTH = CHARUCO_SQUARE_LENGTH
+        self.MARKER_LENGTH = CHARUCO_MARKER_LENGTH
         self.ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_250)
 
-        # 보드가 거꾸로 달려있음 (180도 회전)
-        self.BOARD_FLIPPED = True
+        # 보드가 정방향으로 달려있음
+        self.BOARD_FLIPPED = False
 
         # Offset 설정 (직관적 좌표계 기준, 단위: 미터)
         # 화면 표시 좌표계 (사용자 입력용):
         #   X: 오른쪽 방향 (+)
         #   Y: 위쪽 방향 (+)  ← 직관적
         #   Z: 카메라에서 멀어지는 방향 (+)
-        self.OFFSET_X = 0.07   # 6.5cm 오른쪽
-        self.OFFSET_Y = 0.0     # 0cm
-        self.OFFSET_Z = -0.02     # 0cm
+        self.OFFSET_X = 0.193   # 6.5cm 오른쪽
+        self.OFFSET_Y = -0.15     # 0cm
+        self.OFFSET_Z = -0.01     # 0cm
 
         # ArUco Detector 설정 (OpenCV 버전 호환)
         self.use_new_aruco_api = False
